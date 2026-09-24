@@ -1,0 +1,10 @@
+/assets/
+/.idea/
+/OLD/
+/.venv/
+/video/
+*.mkv
+*.mp4
+*.png
+*.jpg
+test_*.py
