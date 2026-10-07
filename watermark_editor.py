@@ -47,7 +47,7 @@ from PySide6.QtWidgets import (
     QSlider, QGraphicsView, QGraphicsScene, QGraphicsPixmapItem,
     QGraphicsItem, QSplitter, QMessageBox, QDoubleSpinBox, QGroupBox,
     QFormLayout, QAbstractItemView, QStyle, QProgressDialog, QSizePolicy,
-    QScrollArea, QComboBox,
+    QScrollArea, QComboBox, QCheckBox,
 )
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtMultimediaWidgets import QGraphicsVideoItem
@@ -117,6 +117,26 @@ def extract_thumbnail(path: str, kind: str) -> QPixmap:
     return pix
 
 
+@dataclass
+class AudioAsset:
+    id: int
+    asset_path: str
+    start: float = 0.0
+    end: float = 5.0
+    label: str = ""
+    apply_to_streams: List[int] = field(default_factory=list)
+    mode: str = "replace"        # "replace" | "overlay" | "duck"
+    duck_db: float = -12.0       # only used when mode == "duck"
+    new_volume: float = 1.0      # multiplier for the new audio
+    item: Optional["AudioGraphicsItem"] = field(default=None, repr=False)
+
+
+def classify_audio(path: str) -> bool:
+    """True if path looks like a pure audio file we can use."""
+    ext = os.path.splitext(path)[1].lower()
+    return ext in (".mp3", ".wav", ".aac", ".flac", ".m4a", ".ogg", ".opus", ".wma")
+
+
 # ---------------------------------------------------------------------------
 # Asset list (drag source)
 # ---------------------------------------------------------------------------
@@ -178,6 +198,14 @@ class WatermarkGraphicsItem(QGraphicsPixmapItem):
                 self.watermark.x = self.pos().x() / rect.width()
                 self.watermark.y = self.pos().y() / rect.height()
         return super().itemChange(change, value)
+
+
+class AudioGraphicsItem:
+    """Placeholder marker used only so the timeline can highlight audio
+    segments the same way it highlights image watermarks. It has no
+    scene presence - the timeline paints it directly."""
+    def __init__(self, audio: "AudioAsset"):
+        self.audio = audio
 
 
 # ---------------------------------------------------------------------------
@@ -247,10 +275,15 @@ class TimelineWidget(QWidget):
 
     seek_requested = Signal(float)
     watermarks_changed = Signal()
+    # Emitted when the user clicks a segment on the timeline.
+    # Arg is the index in self.watermarks / self.audio_assets (or -1).
+    watermark_clicked = Signal(int)
+    audio_clicked = Signal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.watermarks: List[Watermark] = []
+        self.audio_assets: List[AudioAsset] = []
         self.duration = 0.0
         self.position = 0.0
         self.pixels_per_second = 40.0
@@ -258,9 +291,12 @@ class TimelineWidget(QWidget):
         self.setMouseTracking(True)
         self._drag_mode = None    # "move" | "resize_start" | "resize_end" | "seek"
         self._drag_wm = None
+        self._drag_audio = None
         self._drag_anchor_x = 0
         self._drag_orig_start = 0.0
         self._drag_orig_end = 0.0
+        self.selected_watermark_index = -1
+        self.selected_audio_index = -1
 
     # -- coordinate helpers --------------------------------------------
     def time_to_x(self, t):
@@ -278,7 +314,8 @@ class TimelineWidget(QWidget):
 
     def sizeHint(self):
         width = int(LEFT_MARGIN + self.duration * self.pixels_per_second + 60)
-        height = RULER_HEIGHT + max(4, len(self.watermarks)) * ROW_HEIGHT + 10
+        n_rows = max(4, len(self.watermarks) + len(self.audio_assets))
+        height = RULER_HEIGHT + n_rows * ROW_HEIGHT + 10
         return QSize(max(width, 400), height)
 
     def set_zoom(self, pixels_per_second: float):
@@ -309,7 +346,7 @@ class TimelineWidget(QWidget):
                 painter.drawText(int(x) + 2, 12, self._fmt_time(t))
                 t += step
 
-        # Rows
+        # Watermark rows (blue)
         for i, wm in enumerate(self.watermarks):
             row = self.row_rect(i)
             painter.setPen(QPen(QColor("#444")))
@@ -321,14 +358,43 @@ class TimelineWidget(QWidget):
             x1 = self.time_to_x(wm.start)
             x2 = self.time_to_x(wm.end)
             seg_rect = QRectF(x1, row.top() + 4, max(2, x2 - x1), ROW_HEIGHT - 8)
-            color = QColor("#4a90d9") if wm is self._drag_wm else QColor("#3a6ea5")
+            if i == self.selected_watermark_index:
+                color = QColor("#ff9f40")  # orange = selected
+            elif wm is self._drag_wm:
+                color = QColor("#4a90d9")  # blue = being dragged
+            else:
+                color = QColor("#3a6ea5")  # dark blue = normal
             painter.setBrush(QBrush(color))
             painter.setPen(QPen(QColor("#1c3a5c")))
             painter.drawRoundedRect(seg_rect, 4, 4)
-            # resize handles
             painter.setBrush(QBrush(QColor("#dfeeff")))
             painter.drawRect(QRectF(x1, seg_rect.top(), HANDLE_WIDTH, seg_rect.height()))
             painter.drawRect(QRectF(x2 - HANDLE_WIDTH, seg_rect.top(), HANDLE_WIDTH, seg_rect.height()))
+
+        # Audio rows (green) - continue row numbering after image watermarks
+        audio_offset = len(self.watermarks)
+        for j, au in enumerate(self.audio_assets):
+            i = audio_offset + j
+            row = self.row_rect(i)
+            painter.setPen(QPen(QColor("#444")))
+            painter.drawLine(0, int(row.top()), self.width(), int(row.top()))
+            painter.setPen(QColor("#cfc"))
+            painter.drawText(8, int(row.top()) + ROW_HEIGHT - 10,
+                             "♪ " + (au.label or os.path.basename(au.asset_path))[:14])
+
+            x1 = self.time_to_x(au.start)
+            x2 = self.time_to_x(au.end)
+            seg_rect = QRectF(x1, row.top() + 4, max(2, x2 - x1), ROW_HEIGHT - 8)
+            if j == self.selected_audio_index:
+                color = QColor("#a0e060")  # bright green = selected
+            elif au is getattr(self, "_drag_audio", None):
+                color = QColor("#3aa55c")  # green = being dragged
+            else:
+                color = QColor("#2d7a44")  # dark green = normal
+            painter.setBrush(QBrush(color))
+            painter.setPen(QPen(QColor("#1a4a2a")))
+            painter.drawRoundedRect(seg_rect, 4, 4)
+            # No resize handles drawn - audio segments are move-only.
 
         # Playhead
         if self.duration > 0:
@@ -363,11 +429,17 @@ class TimelineWidget(QWidget):
             self._drag_mode = "seek"
             self.seek_requested.emit(self.x_to_time(x))
             return
+
         row_index = int((y - RULER_HEIGHT) // ROW_HEIGHT)
-        if 0 <= row_index < len(self.watermarks):
+        n_wm = len(self.watermarks)
+        n_au = len(self.audio_assets)
+
+        # Watermark rows
+        if 0 <= row_index < n_wm:
             wm = self.watermarks[row_index]
             x1, x2 = self.time_to_x(wm.start), self.time_to_x(wm.end)
             self._drag_wm = wm
+            self._drag_audio = None
             self._drag_orig_start = wm.start
             self._drag_orig_end = wm.end
             self._drag_anchor_x = x
@@ -380,32 +452,70 @@ class TimelineWidget(QWidget):
             else:
                 self._drag_mode = None
                 self._drag_wm = None
+            if self._drag_wm is not None:
+                self.watermark_clicked.emit(row_index)
+                self.audio_clicked.emit(-1)  # deselect any audio
+        # Audio rows
+        elif n_wm <= row_index < n_wm + n_au:
+            au = self.audio_assets[row_index - n_wm]
+            x1, x2 = self.time_to_x(au.start), self.time_to_x(au.end)
+            self._drag_audio = au
+            self._drag_wm = None
+            self._drag_orig_start = au.start
+            self._drag_orig_end = au.end
+            self._drag_anchor_x = x
+            # Audio segments can only be MOVED, never resized: the audio's
+            # duration must stay exactly as long as the file itself, so
+            # shrinking/stretching the segment would either cut the audio
+            # short or leave it padded with silence. Users who want a
+            # different duration should provide a different audio file.
+            if x1 <= x <= x2:
+                self._drag_mode = "move"
+            else:
+                self._drag_mode = None
+                self._drag_audio = None
+            if self._drag_audio is not None:
+                self.audio_clicked.emit(row_index - n_wm)
+                self.watermark_clicked.emit(-1)  # deselect any watermark
+        else:
+            self._drag_mode = None
+            self._drag_wm = None
+            self._drag_audio = None
+            self.watermark_clicked.emit(-1)
+            self.audio_clicked.emit(-1)
         self.update()
 
     def mouseMoveEvent(self, event):
         if self._drag_mode == "seek":
             self.seek_requested.emit(self.x_to_time(event.position().x()))
             return
-        if self._drag_wm is None or self._drag_mode is None:
+        target = self._drag_wm if self._drag_wm is not None else self._drag_audio
+        if target is None or self._drag_mode is None:
             return
+
+        # Safety: audio segments must never be resized, only moved.
+        # If somehow a resize mode leaked through, force it to move.
+        if self._drag_audio is not None and self._drag_mode in ("resize_start", "resize_end"):
+            self._drag_mode = "move"
+
         dx = event.position().x() - self._drag_anchor_x
         dt = dx / max(self.pixels_per_second, 0.0001)
-        wm = self._drag_wm
         if self._drag_mode == "move":
             duration = self._drag_orig_end - self._drag_orig_start
             new_start = max(0.0, min(self.duration - duration, self._drag_orig_start + dt))
-            wm.start = new_start
-            wm.end = new_start + duration
+            target.start = new_start
+            target.end = new_start + duration
         elif self._drag_mode == "resize_start":
-            wm.start = max(0.0, min(self._drag_orig_end - 0.1, self._drag_orig_start + dt))
+            target.start = max(0.0, min(self._drag_orig_end - 0.1, self._drag_orig_start + dt))
         elif self._drag_mode == "resize_end":
-            wm.end = min(self.duration, max(self._drag_orig_start + 0.1, self._drag_orig_end + dt))
+            target.end = min(self.duration, max(self._drag_orig_start + 0.1, self._drag_orig_end + dt))
         self.update()
         self.watermarks_changed.emit()
 
     def mouseReleaseEvent(self, event):
         self._drag_mode = None
         self._drag_wm = None
+        self._drag_audio = None
         self.update()
 
 
@@ -486,6 +596,11 @@ class MainWindow(QMainWindow):
         self.watermarks: List[Watermark] = []
         self._next_id = 1
 
+        self.audio_assets: List[AudioAsset] = []
+        self._next_audio_id = 1
+        self._selected_audio: Optional[AudioAsset] = None
+        self._audio_stream_checkboxes: List[QCheckBox] = []
+
         # -- media player / video scene --------------------------------
         self.scene = QGraphicsScene(self)
         self.video_item = QGraphicsVideoItem()
@@ -539,6 +654,9 @@ class MainWindow(QMainWindow):
         self.timeline_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.timeline_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
 
+        self.timeline.watermark_clicked.connect(self._on_timeline_watermark_clicked)
+        self.timeline.audio_clicked.connect(self._on_timeline_audio_clicked)
+
         center = QWidget()
         center_layout = QVBoxLayout(center)
         center_layout.setContentsMargins(4, 4, 4, 4)
@@ -556,6 +674,17 @@ class MainWindow(QMainWindow):
         assets_layout = QVBoxLayout(assets_box)
         assets_layout.addWidget(self.asset_list)
         assets_layout.addWidget(add_asset_btn)
+
+        # ---------- Audio assets ----------
+        self.audio_list = QListWidget()
+        self.audio_list.currentRowChanged.connect(self._on_audio_selected)
+        add_audio_btn = QPushButton("Add Audio Asset...")
+        add_audio_btn.clicked.connect(self._browse_audio)
+
+        audio_assets_box = QGroupBox("Audio Assets  (double-click row to place)")
+        audio_assets_layout = QVBoxLayout(audio_assets_box)
+        audio_assets_layout.addWidget(self.audio_list)
+        audio_assets_layout.addWidget(add_audio_btn)
 
         self.scale_spin = QDoubleSpinBox()
         self.scale_spin.setRange(0.02, 2.0)
@@ -576,13 +705,98 @@ class MainWindow(QMainWindow):
         self.remove_btn = QPushButton("Remove Selected Watermark")
         self.remove_btn.clicked.connect(self._remove_selected_watermark)
 
+        self.audio_list.itemDoubleClicked.connect(self._on_audio_item_double_clicked)
+
         props_box = QGroupBox("Selected Watermark")
         props_form = QFormLayout(props_box)
         props_form.addRow("Width (fraction of video):", self.scale_spin)
         props_form.addRow("Start:", self.start_spin)
         props_form.addRow("End:", self.end_spin)
         props_form.addRow(self.remove_btn)
-        
+
+        self.remove_audio_btn = QPushButton("Remove Selected Audio")
+        self.remove_audio_btn.clicked.connect(self._remove_selected_audio)
+
+        # Audio codec controls
+        self.audio_codec_combo = QComboBox()
+        self.audio_codec_combo.addItems([
+            "Auto (match source)",
+            "aac", "libopus", "libmp3lame", "libvorbis", "flac",
+        ])
+        self.audio_codec_combo.setCurrentText("Auto (match source)")
+
+        self.audio_bitrate_spin = QDoubleSpinBox()
+        self.audio_bitrate_spin.setRange(32, 512)
+        self.audio_bitrate_spin.setSingleStep(16)
+        self.audio_bitrate_spin.setSuffix(" kbps")
+        self.audio_bitrate_spin.setValue(192)
+
+        # NEW: Replacement mode controls
+        self.audio_mode_combo = QComboBox()
+        self.audio_mode_combo.addItems([
+            "Replace (mute source, play new audio)",
+            "Overlay (mix new audio on top of source)",
+            "Duck (lower source, play new audio on top)",
+        ])
+        self.audio_mode_combo.setCurrentText("Replace (mute source, play new audio)")
+        self.audio_mode_combo.setToolTip(
+            "Replace: source is silenced during the window; only new audio plays.\n"
+            "Overlay: source keeps playing at full volume; new audio is mixed on top.\n"
+            "Duck: source is lowered in volume (not muted); new audio plays on top."
+        )
+        self.audio_mode_combo.currentIndexChanged.connect(self._on_audio_mode_changed)
+
+        self.audio_duck_db_spin = QDoubleSpinBox()
+        self.audio_duck_db_spin.setRange(-60.0, -3.0)
+        self.audio_duck_db_spin.setSingleStep(1.0)
+        self.audio_duck_db_spin.setValue(-12.0)
+        self.audio_duck_db_spin.setSuffix(" dB")
+        self.audio_duck_db_spin.setToolTip(
+            "Only used in Duck mode. How much to lower the source audio\n"
+            "during the replacement window (e.g. -12 dB = quieter but still audible)."
+        )
+        self.audio_duck_db_spin.setEnabled(False)
+
+        self.audio_new_volume_spin = QDoubleSpinBox()
+        self.audio_new_volume_spin.setRange(0.0, 4.0)
+        self.audio_new_volume_spin.setSingleStep(0.1)
+        self.audio_new_volume_spin.setValue(1.0)
+        self.audio_new_volume_spin.setToolTip(
+            "Volume multiplier for the new audio. 1.0 = unchanged, "
+            "0.5 = half volume, 2.0 = twice as loud."
+        )
+
+        self.audio_duck_db_spin.valueChanged.connect(self._on_audio_duck_db_changed)
+        self.audio_new_volume_spin.valueChanged.connect(self._on_audio_new_volume_changed)
+
+        # Container for stream checkboxes (populated on video load)
+        self.audio_streams_box = QGroupBox("Apply to audio streams")
+        self.audio_streams_layout = QVBoxLayout(self.audio_streams_box)
+        self.audio_streams_placeholder = QLabel("Load a video first.")
+        self.audio_streams_placeholder.setStyleSheet("color: #888;")
+        self.audio_streams_layout.addWidget(self.audio_streams_placeholder)
+
+        audio_props_box = QGroupBox("Selected Audio")
+        audio_props_form = QFormLayout(audio_props_box)
+        audio_props_form.addRow("Mode:", self.audio_mode_combo)
+        audio_props_form.addRow("Duck amount:", self.audio_duck_db_spin)
+        audio_props_form.addRow("New audio volume:", self.audio_new_volume_spin)
+        audio_props_form.addRow("Codec:", self.audio_codec_combo)
+        audio_props_form.addRow("Bitrate:", self.audio_bitrate_spin)
+        audio_props_form.addRow(self.audio_streams_box)
+        audio_props_form.addRow(self.remove_audio_btn)
+
+        # ---------- Export options ----------
+        self.apply_image_cb = QCheckBox("Apply image watermarks")
+        self.apply_image_cb.setChecked(True)
+        self.apply_audio_cb = QCheckBox("Apply audio replacement")
+        self.apply_audio_cb.setChecked(True)
+
+        export_opts_box = QGroupBox("Export Options")
+        export_opts_layout = QVBoxLayout(export_opts_box)
+        export_opts_layout.addWidget(self.apply_image_cb)
+        export_opts_layout.addWidget(self.apply_audio_cb)
+
         # ---------- Encoding settings box ----------
         self.rate_mode_combo = QComboBox()
         self.rate_mode_combo.addItems([
@@ -620,7 +834,7 @@ class MainWindow(QMainWindow):
         self.bitrate_spin.setSuffix(" kbps")
         self.bitrate_spin.setValue(2000)
         #self.bitrate_spin.setEnabled(False)
-        
+
         self._on_rate_mode_changed(0)
 
         self.force_encoder_combo = QComboBox()
@@ -670,19 +884,35 @@ class MainWindow(QMainWindow):
 
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
-        right_layout.addWidget(assets_box, stretch=2)
+        right_layout.setContentsMargins(8, 8, 8, 8)
+        right_layout.setSpacing(8)
+        right_layout.addWidget(assets_box)
         right_layout.addWidget(props_box)
+        right_layout.addWidget(audio_assets_box)
+        right_layout.addWidget(audio_props_box)
         right_layout.addWidget(encode_box)
+        right_layout.addWidget(export_opts_box)
         right_layout.addStretch(1)
         right_layout.addWidget(self.encoder_label)
         right_layout.addWidget(copy_cmd_btn)
         right_layout.addWidget(export_btn)
-        right_panel.setFixedWidth(360)
+
+        # Wrap the right panel in a scroll area so all controls stay reachable
+        # regardless of window height.
+        right_scroll = QScrollArea()
+        right_scroll.setWidget(right_panel)
+        right_scroll.setWidgetResizable(True)
+        right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        right_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        right_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        right_scroll.setMinimumWidth(420)
+        right_scroll.setMaximumWidth(560)
 
         splitter = QSplitter(self)
         splitter.addWidget(center)
-        splitter.addWidget(right_panel)
+        splitter.addWidget(right_scroll)
         splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 0)
         self.setCentralWidget(splitter)
 
         self._selected_watermark: Optional[Watermark] = None
@@ -719,6 +949,7 @@ class MainWindow(QMainWindow):
         self.player.setSource(QUrl.fromLocalFile(path))
         self.setWindowTitle(f"Video Watermark Editor - {os.path.basename(path)}")
         self.statusBar().showMessage(f"Loaded {path}")
+        self._refresh_audio_stream_checkboxes()
 
     def _on_native_size_changed(self, size):
         if size.width() <= 0 or size.height() <= 0:
@@ -768,6 +999,14 @@ class MainWindow(QMainWindow):
         self.timeline.update()
         total = self.player.duration() / 1000.0
         self.time_label.setText(f"{self.timeline._fmt_time(pos)} / {self.timeline._fmt_time(total)}")
+
+    def _on_audio_duck_db_changed(self, value):
+        if self._selected_audio:
+            self._selected_audio.duck_db = value
+
+    def _on_audio_new_volume_changed(self, value):
+        if self._selected_audio:
+            self._selected_audio.new_volume = value
 
     # ------------------------------------------------------------------
     # Watermark assets
@@ -858,6 +1097,37 @@ class MainWindow(QMainWindow):
         else:
             self._selected_watermark = None
 
+    def _on_timeline_watermark_clicked(self, index):
+        if 0 <= index < len(self.watermarks):
+            wm = self.watermarks[index]
+            self.scene.clearSelection()
+            if wm.item is not None:
+                wm.item.setSelected(True)
+            self._select_watermark(wm)
+            self._selected_audio = None
+            self.timeline.selected_watermark_index = index
+            self.timeline.selected_audio_index = -1
+            self.timeline.update()
+        else:
+            self._selected_watermark = None
+            self.timeline.selected_watermark_index = -1
+            self.timeline.update()
+
+    def _on_timeline_audio_clicked(self, index):
+        if 0 <= index < len(self.audio_assets):
+            au = self.audio_assets[index]
+            self._select_audio(au)
+            self.scene.clearSelection()
+            self._selected_watermark = None
+            # Tell the timeline to highlight this one
+            self.timeline.selected_audio_index = index
+            self.timeline.selected_watermark_index = -1
+            self.timeline.update()
+        else:
+            self._selected_audio = None
+            self.timeline.selected_audio_index = -1
+            self.timeline.update()
+
     def _select_watermark(self, wm: Watermark):
         self._selected_watermark = wm
         self.scale_spin.blockSignals(True)
@@ -869,6 +1139,13 @@ class MainWindow(QMainWindow):
         self.scale_spin.blockSignals(False)
         self.start_spin.blockSignals(False)
         self.end_spin.blockSignals(False)
+        try:
+            idx = self.watermarks.index(wm)
+            self.timeline.selected_watermark_index = idx
+            self.timeline.selected_audio_index = -1
+            self.timeline.update()
+        except ValueError:
+            pass
 
     def _on_scale_changed(self, value):
         if self._selected_watermark:
@@ -895,11 +1172,227 @@ class MainWindow(QMainWindow):
         self.timeline.watermarks = self.watermarks
         self.timeline.refresh_size()
         self._selected_watermark = None
-        
+        self.timeline.selected_watermark_index = -1
+        self.timeline.update()
+
+    def _on_audio_item_double_clicked(self, item):
+        data = item.data(Qt.ItemDataRole.UserRole)
+        if data and "path" in data:
+            self._add_audio_asset(data["path"])
+
+    # ------------------------------------------------------------------
+    # Audio assets
+    # ------------------------------------------------------------------
+    def _browse_audio(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Add Audio Asset", "",
+            "Audio Files (*.mp3 *.wav *.aac *.flac *.m4a *.ogg *.opus *.wma)"
+        )
+        if not path:
+            return
+        if not classify_audio(path):
+            QMessageBox.warning(self, "Not audio",
+                                 "That file doesn't look like a pure audio file.")
+            return
+        item = QListWidgetItem(f"{os.path.basename(path)}")
+        item.setData(Qt.ItemDataRole.UserRole, {"path": path})
+        self.audio_list.addItem(item)
+        # auto-create an AudioAsset instance so the user can see it on the timeline
+        # self._add_audio_asset(path)
+
+    def _add_audio_asset(self, path: str):
+        if self.timeline.duration <= 0:
+            QMessageBox.information(self, "Load video first",
+                                    "Load a source video before adding audio.")
+            return
+
+        # Probe duration FIRST so we can use it in the label.
+        dur = self._probe_audio_duration(path) or 5.0
+        dur = max(0.1, dur)  # guard against broken/zero-length files
+
+        au = AudioAsset(
+            id=self._next_audio_id,
+            asset_path=path,
+            label=f"{os.path.basename(path)}  [{dur:.1f}s]",
+        )
+        self._next_audio_id += 1
+
+        cur = self.player.position() / 1000.0
+        au.start = cur
+        au.end = min(self.timeline.duration, cur + dur)
+        au.apply_to_streams = []
+        self.audio_assets.append(au)
+        self.timeline.audio_assets = self.audio_assets
+        self.timeline.refresh_size()
+        self._select_audio(au)
+
+        # Warn if the audio is longer than the remaining video.
+        remaining = self.timeline.duration - cur
+        if dur > remaining:
+            self.statusBar().showMessage(
+                f"Note: audio ({dur:.1f}s) is longer than the remaining "
+                f"video ({remaining:.1f}s); it will be cut short.",
+                8000
+            )
+
+    def _on_audio_selected(self, row: int):
+        if 0 <= row < len(self.audio_assets):
+            self._select_audio(self.audio_assets[row])
+
+    def _select_audio(self, au: AudioAsset):
+        self._selected_audio = au
+        # Sync mode combo
+        mode_map = {"replace": 0, "overlay": 1, "duck": 2}
+        self.audio_mode_combo.blockSignals(True)
+        self.audio_mode_combo.setCurrentIndex(mode_map.get(au.mode, 0))
+        self.audio_mode_combo.blockSignals(False)
+        self.audio_duck_db_spin.blockSignals(True)
+        self.audio_duck_db_spin.setValue(au.duck_db)
+        self.audio_duck_db_spin.blockSignals(False)
+        self.audio_duck_db_spin.setEnabled(au.mode == "duck")
+        self.audio_new_volume_spin.blockSignals(True)
+        self.audio_new_volume_spin.setValue(au.new_volume)
+        self.audio_new_volume_spin.blockSignals(False)
+        # refresh stream checkbox states
+        self._refresh_audio_stream_checkboxes()
+        try:
+            idx = self.audio_assets.index(au)
+            self.timeline.selected_audio_index = idx
+            self.timeline.selected_watermark_index = -1
+            self.timeline.update()
+        except ValueError:
+            pass
+
+    def _remove_selected_audio(self):
+        au = self._selected_audio
+        if not au:
+            return
+        if au in self.audio_assets:
+            self.audio_assets.remove(au)
+        self.timeline.audio_assets = self.audio_assets
+        self.timeline.refresh_size()
+        self._selected_audio = None
+        self.timeline.selected_audio_index = -1
+        self.timeline.update()
+
+    def _refresh_audio_stream_checkboxes(self):
+        """Rebuild the checkbox list based on probed audio streams."""
+        # clear old
+        while self.audio_streams_layout.count():
+            item = self.audio_streams_layout.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+        self._audio_stream_checkboxes = []
+
+        if not self.video_path:
+            lbl = QLabel("Load a video first.")
+            lbl.setStyleSheet("color: #888;")
+            self.audio_streams_layout.addWidget(lbl)
+            return
+
+        streams = self._probe_audio_streams(self.video_path)
+        if not streams:
+            lbl = QLabel("No audio streams found.")
+            lbl.setStyleSheet("color: #888;")
+            self.audio_streams_layout.addWidget(lbl)
+            return
+
+        # "All streams" master checkbox
+        all_cb = QCheckBox("All audio streams")
+        all_cb.setChecked(True)
+        self.audio_streams_layout.addWidget(all_cb)
+
+        cb_list = []
+        for pos, s in enumerate(streams):
+            label = s.get("language") or s.get("title") or f"Stream #{s['index']}"
+            codec = s.get("codec_name", "?")
+            channels = s.get("channels", "?")
+            cb = QCheckBox(f"[{s['index']}] {label} ({codec}, {channels}ch)")
+            cb.setChecked(True)
+            self.audio_streams_layout.addWidget(cb)
+            # Store `pos` (0-based position among AUDIO streams only), not
+            # s["index"] (the stream's position in the whole container,
+            # which includes video/subtitle streams before it). _build_
+            # ffmpeg_command compares against audio-only indices (it maps
+            # streams as 0:a:0, 0:a:1, ...), so storing the container-wide
+            # index here was applying replacements to the wrong track
+            # whenever anything (almost always the video stream) came
+            # before the first audio stream.
+            cb_list.append((pos, cb))
+
+        def on_all_toggled(state):
+            for _, cb in cb_list:
+                cb.setChecked(state == Qt.CheckState.Checked.value or state == 2)
+
+        def on_child_toggled(_):
+            all_checked = all(cb.isChecked() for _, cb in cb_list)
+            all_cb.blockSignals(True)
+            all_cb.setChecked(all_checked)
+            all_cb.blockSignals(False)
+            self._on_stream_selection_changed()
+
+        all_cb.stateChanged.connect(on_all_toggled)
+        for _, cb in cb_list:
+            cb.stateChanged.connect(on_child_toggled)
+
+        self._audio_stream_checkboxes = cb_list
+        self._on_stream_selection_changed()
+
+    def _on_stream_selection_changed(self):
+        """When user toggles streams, save to the selected audio asset."""
+        if not self._selected_audio:
+            return
+        selected = [idx for idx, cb in self._audio_stream_checkboxes if cb.isChecked()]
+        all_indices = [idx for idx, _ in self._audio_stream_checkboxes]
+        # empty list means "all streams" - but only if literally all are selected
+        if set(selected) == set(all_indices):
+            self._selected_audio.apply_to_streams = []
+        else:
+            self._selected_audio.apply_to_streams = selected
+
+    def _probe_audio_streams(self, path):  # noqa
+        """Return list of dicts describing each audio stream in the file."""
+        ffprobe = shutil.which("ffprobe")
+        if not ffprobe:
+            return []
+        try:
+            out = subprocess.run(
+                [ffprobe, "-v", "error", "-select_streams", "a",
+                 "-show_entries",
+                 "stream=index,codec_name,channels:stream_tags=language,title",
+                 "-of", "json", path],
+                capture_output=True, text=True, timeout=15
+            )
+            data = json.loads(out.stdout)
+            streams = data.get("streams", [])
+            result = []
+            for s in streams:
+                tags = s.get("tags") or {}
+                result.append({
+                    "index": s.get("index", 0),
+                    "codec_name": s.get("codec_name", "?"),
+                    "channels": s.get("channels", "?"),
+                    "language": tags.get("language"),
+                    "title": tags.get("title"),
+                })
+            return result
+        except Exception:
+            return []
+
+    # ------------------------------------------------------------------
     def _on_rate_mode_changed(self, index):
         is_crf = (index == 0)
         self.crf_spin.setEnabled(is_crf)
         self.bitrate_spin.setEnabled(not is_crf)
+
+    def _on_audio_mode_changed(self, index):
+        # index 0 = Replace, 1 = Overlay, 2 = Duck
+        is_duck = (index == 2)
+        self.audio_duck_db_spin.setEnabled(is_duck)
+        # Save to selected audio
+        if self._selected_audio:
+            self._selected_audio.mode = ["replace", "overlay", "duck"][index]
 
     def _match_source_bitrate(self):
         if not self.video_path:
@@ -984,6 +1477,23 @@ class MainWindow(QMainWindow):
             data = json.loads(out.stdout)
             bps = data["streams"][0].get("bit_rate")
             return int(bps) / 1000.0 if bps else None
+        except Exception:
+            return None
+
+    def _probe_audio_duration(self, path):
+        """Return the duration of an audio file in seconds, or None."""
+        ffprobe = shutil.which("ffprobe")
+        if not ffprobe:
+            return None
+        try:
+            out = subprocess.run(
+                [ffprobe, "-v", "error", "-show_entries", "format=duration",
+                 "-of", "json", path],
+                capture_output=True, text=True, timeout=15
+            )
+            data = json.loads(out.stdout)
+            dur = (data.get("format") or {}).get("duration")
+            return float(dur) if dur else None
         except Exception:
             return None
 
@@ -1196,43 +1706,212 @@ class MainWindow(QMainWindow):
         if not width or not height:
             raise RuntimeError("Could not determine source video resolution.")
 
+        apply_image = self.apply_image_cb.isChecked()
+        apply_audio = self.apply_audio_cb.isChecked()
+
         args = [ffmpeg, "-y", "-i", self.video_path]
 
-        filter_parts = []
-        current_label = "0:v"
+        # --- Input list: image watermarks + audio replacements ---
+        # We only add inputs for what's actually enabled.
+        image_filter_parts = []
+        audio_filter_parts = []
+        current_video_label = "0:v"
         input_index = 1
 
-        for i, wm in enumerate(self.watermarks):
-            #total = max(wm.end, wm.start + 0.1)
-            #args += ["-loop", "1", "-t", f"{total:.3f}", "-i", wm.asset_path]  # Loop Bug Instance
-            args += ["-i", wm.asset_path]
+        image_inputs = []   # (input_index, wm)
+        audio_inputs = []   # (input_index, au)
 
-            wm_w = max(2, round(width * wm.scale))
-            scaled_label = f"wms{i}"
-            filter_parts.append(f"[{input_index}:v]scale={wm_w}:-1[{scaled_label}]")
+        if apply_image:
+            for wm in self.watermarks:
+                args += ["-i", wm.asset_path]
+                image_inputs.append((input_index, wm))
+                input_index += 1
 
-            x_px = round(wm.x * width)
-            y_px = round(wm.y * height)
-            out_label = f"v{i}"
-            filter_parts.append(
-                f"[{current_label}][{scaled_label}]overlay=x={x_px}:y={y_px}:"
-                f"enable='between(t,{wm.start:.3f},{wm.end:.3f})'[{out_label}]"
-            )
-            current_label = out_label
-            input_index += 1
+        if apply_audio:
+            for au in self.audio_assets:
+                args += ["-i", au.asset_path]
+                audio_inputs.append((input_index, au))
+                input_index += 1
 
-        if filter_parts:
-            args += ["-filter_complex", ";".join(filter_parts), "-map", f"[{current_label}]"]
+        # --- Video filter graph ---
+        if apply_image and image_inputs:
+            for k, (idx, wm) in enumerate(image_inputs):
+                wm_w = max(2, round(width * wm.scale))
+                scaled_label = f"wms{k}"
+                image_filter_parts.append(f"[{idx}:v]scale={wm_w}:-1[{scaled_label}]")
+                x_px = round(wm.x * width)
+                y_px = round(wm.y * height)
+                out_label = f"v{k}"
+                image_filter_parts.append(
+                    f"[{current_video_label}][{scaled_label}]overlay="
+                    f"x={x_px}:y={y_px}:"
+                    f"enable='between(t,{wm.start:.3f},{wm.end:.3f})'[{out_label}]"
+                )
+                current_video_label = out_label
+
+        # --- Audio filter graph ---
+        # Strategy: for each replacement, split the source audio, mute the
+        # selected window, and mix in the replacement audio at the same
+        # window. Streams not selected in `apply_to_streams` are untouched.
+        n_audio_in_source = len(self._probe_audio_streams(self.video_path))
+
+        # We only apply audio replacement to selected streams. If a stream
+        # is not selected, it goes through with `-c:a copy`.
+        # Build per-stream filter graphs.
+        audio_out_label_by_stream = {}   # source_stream_index -> final label or None
+
+        if apply_audio and audio_inputs:
+            for src_idx in range(n_audio_in_source):
+                # Find replacements targeting this stream
+                active = []
+                for inp_idx, au in audio_inputs:
+                    if au.apply_to_streams and src_idx not in au.apply_to_streams:
+                        continue
+                    active.append((inp_idx, au))
+                if not active:
+                    continue
+
+                # Chain the replacements together instead of splitting the
+                # source. Each replacement:
+                #   1. mutes its window in the *current* chain output
+                #   2. mixes in the delayed replacement audio
+                #   3. passes the result on to the next replacement
+                #
+                # This avoids asplit entirely, which had a bug where the
+                # extra output would go unconnected and ffmpeg would error
+                # out with "Filter 'asplit' has output N unconnected".
+                current_label = f"0:a:{src_idx}"
+
+                for i, (inp_idx, au) in enumerate(active):
+                    ducked_label = f"ducked_{src_idx}_{i}"
+                    delayed_label = f"delayed_{src_idx}_{i}"
+                    out_label = f"amix_{src_idx}_{i}"
+
+                    # 1. Modify the source audio during [au.start, au.end],
+                    #    depending on the mode.
+                    mode = getattr(au, "mode", "replace")
+                    if mode == "replace":
+                        # Silence the source completely in the window.
+                        vol_expr = "volume=0"
+                    elif mode == "overlay":
+                        # Keep the source at full volume - no change needed.
+                        vol_expr = "volume=1.0"
+                    elif mode == "duck":
+                        # Lower the source volume by duck_db (e.g. -12 dB).
+                        # volume filter accepts a linear multiplier, so convert.
+                        duck_linear = 10 ** (au.duck_db / 20.0)
+                        vol_expr = f"volume={duck_linear:.4f}"
+                    else:
+                        vol_expr = "volume=0"
+
+                    audio_filter_parts.append(
+                        f"[{current_label}]"
+                        f"{vol_expr}:"
+                        f"enable='between(t,{au.start:.3f},{au.end:.3f})'"
+                        f"[{ducked_label}]"
+                    )
+
+                    # 2. Trim the replacement to at most (end - start) long,
+                    #    then delay it so it starts at au.start, then apply
+                    #    the user's volume multiplier. Without the atrim, a
+                    #    replacement clip longer than its window would keep
+                    #    playing past au.end and overlap with the original
+                    #    audio un-muting at that point.
+                    window_dur = max(0.05, au.end - au.start)
+                    delay_ms = int(au.start * 1000)
+                    new_vol = getattr(au, "new_volume", 1.0)
+                    audio_filter_parts.append(
+                        f"[{inp_idx}:a]"
+                        f"atrim=0:{window_dur:.3f},asetpts=PTS-STARTPTS,"
+                        f"adelay={delay_ms}|{delay_ms},"
+                        f"volume={new_vol:.4f}"
+                        f"[{delayed_label}]"
+                    )
+
+                    # 3. Mix the (possibly modified) source with the delayed
+                    #    replacement. For "overlay" mode the source is at full
+                    #    volume and the replacement is added on top. For
+                    #    "replace" the source is silent, so effectively only
+                    #    the new audio is heard. duration=first keeps the
+                    #    original stream length.
+                    audio_filter_parts.append(
+                        f"[{ducked_label}][{delayed_label}]"
+                        f"amix=inputs=2:duration=first:dropout_transition=0"
+                        f":normalize=0"
+                        f",alimiter=limit=0.95"
+                        f"[{out_label}]"
+                    )
+                    current_label = out_label
+
+                audio_out_label_by_stream[src_idx] = current_label
+
+        # --- Emit filter_complex ---
+        all_filters = image_filter_parts + audio_filter_parts
+        if all_filters:
+            args += ["-filter_complex", ";".join(all_filters)]
+
+        # --- Video mapping / codec ---
+        if apply_image and image_inputs:
+            args += ["-map", f"[{current_video_label}]"]
+            args += self._detect_video_encoder_args()
         else:
             args += ["-map", "0:v"]
+            args += ["-c:v", "copy"]
 
-        args += ["-map", "0:a?", "-c:a", "copy"]
+        # --- Audio mapping / codec ---
+        # Determine output audio codec from user selection
+        chosen_audio_codec = self.audio_codec_combo.currentText()
+        audio_bitrate = int(self.audio_bitrate_spin.value())
+        if chosen_audio_codec.startswith("Auto"):
+            # Match the first source audio codec, fall back to aac
+            streams = self._probe_audio_streams(self.video_path)
+            src_a = streams[0]["codec_name"] if streams else "aac"
+            codec_map = {
+                "aac": "aac", "opus": "libopus", "mp3": "libmp3lame",
+                "vorbis": "libvorbis", "flac": "flac", "pcm_s16le": "pcm_s16le",
+            }
+            chosen_audio_codec = codec_map.get(src_a, "aac")
+
+        for src_idx in range(n_audio_in_source):
+            if src_idx in audio_out_label_by_stream:
+                # This stream is modified: use the filter output
+                args += ["-map", f"[{audio_out_label_by_stream[src_idx]}]"]
+                args += [f"-c:a:{src_idx}", chosen_audio_codec]
+                if chosen_audio_codec not in ("flac", "pcm_s16le"):
+                    args += [f"-b:a:{src_idx}", f"{audio_bitrate}k"]
+            else:
+                # This stream is untouched: straight copy
+                args += ["-map", f"0:a:{src_idx}"]
+                args += [f"-c:a:{src_idx}", "copy"]
+
+        # --- Subtitles: always copy ---
         args += ["-map", "0:s?", "-c:s", "copy"]
 
+        # --- Metadata ---
         args += ["-map_metadata", "0", "-map_chapters", "0"]
-        args += ["-map_metadata:s", "0:s"]
+        # Per-stream metadata (language tags, titles) needs an explicit index
+        # per track - a bare "-map_metadata:s 0:s" isn't documented ffmpeg
+        # syntax for "every stream of this type" and audio had no per-stream
+        # metadata mapping at all, so language tags on audio tracks were
+        # likely being silently dropped the same way subtitle tags were in
+        # earlier testing.
+        n_audio_total, n_sub_total = self._probe_stream_counts(self.video_path)
+        for i in range(n_audio_total):
+            args += [f"-map_metadata:s:a:{i}", f"0:s:a:{i}"]
+        for i in range(n_sub_total):
+            args += [f"-map_metadata:s:s:{i}", f"0:s:s:{i}"]
 
-        args += self._detect_video_encoder_args()
+        # Safety nets, neither of which touches encoding quality/structure:
+        # - "-t" hard-caps the output at the video's own known duration, so
+        #   a mismatched-length secondary stream (e.g. a longer commentary
+        #   audio track - a real authoring defect seen in some files) can't
+        #   silently extend the whole export past the actual video content.
+        # - "-max_muxing_queue_size" guards against a genuine hang on long
+        #   files where the muxer has to buffer packets while reordering.
+        total_duration = self.timeline.duration
+        if total_duration and total_duration > 0:
+            args += ["-t", f"{total_duration:.3f}"]
+        args += ["-max_muxing_queue_size", "9999"]
 
         args += [output_path]
         return args
@@ -1273,10 +1952,25 @@ class MainWindow(QMainWindow):
         if not self.video_path:
             QMessageBox.warning(self, "No video", "Load a source video first.")
             return
+        if not self.apply_image_cb.isChecked() and not self.apply_audio_cb.isChecked():
+            QMessageBox.warning(self, "Nothing to do",
+                                 "Enable at least one of: image watermarks or audio replacement.")
+            return
         if not shutil.which("ffmpeg"):
             QMessageBox.critical(self, "ffmpeg not found",
                                   "ffmpeg was not found on PATH. Install it and try again.")
             return
+
+        summary = []
+        if self.apply_image_cb.isChecked():
+            summary.append(f"{len(self.watermarks)} image watermark(s)")
+        if self.apply_audio_cb.isChecked():
+            summary.append(f"{len(self.audio_assets)} audio replacement(s)")
+        QMessageBox.information(
+            self, "Export Summary",
+            f"About to export with:\n\n" + "\n".join(summary)
+        )
+
         src_base = os.path.splitext(os.path.basename(self.video_path))[0]
         src_ext = os.path.splitext(self.video_path)[1].lower()
         default_ext = src_ext if src_ext in (".mp4", ".mkv", ".mov") else ".mp4"
@@ -1316,7 +2010,7 @@ class MainWindow(QMainWindow):
             if t_match:
                 h, m, s = t_match[-1]
                 done_sec = int(h) * 3600 + int(m) * 60 + float(s)
-                pct = min(99, int(100 * done_sec / total_duration))
+                pct = min(100, int(100 * done_sec / total_duration))
                 speed = s_match[-1] if s_match else "?"
                 progress.setLabelText(
                     f"Exporting... {pct}%  "
