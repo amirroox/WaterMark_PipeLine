@@ -47,7 +47,7 @@ from PySide6.QtWidgets import (
     QSlider, QGraphicsView, QGraphicsScene, QGraphicsPixmapItem,
     QGraphicsItem, QSplitter, QMessageBox, QDoubleSpinBox, QGroupBox,
     QFormLayout, QAbstractItemView, QStyle, QProgressDialog, QSizePolicy,
-    QScrollArea, QComboBox, QCheckBox,
+    QScrollArea, QComboBox, QCheckBox, QSpinBox,
 )
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtMultimediaWidgets import QGraphicsVideoItem
@@ -67,6 +67,8 @@ class Watermark:
     scale: float = 0.25      # watermark width as a fraction of video width
     start: float = 0.0       # seconds
     end: float = 5.0         # seconds
+    center_x: bool = False   # True = export centers horizontally in the frame
+    center_y: bool = False   # True = export centers vertically in the frame
     label: str = ""
     item: Optional["WatermarkGraphicsItem"] = field(default=None, repr=False)
 
@@ -183,6 +185,7 @@ class WatermarkGraphicsItem(QGraphicsPixmapItem):
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges, True)
         self.setAcceptHoverEvents(True)
         self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self.on_moved = None  # callback(watermark), set by MainWindow
 
     def itemChange(self, change, value):
         if change == QGraphicsItem.GraphicsItemChange.ItemPositionChange and self.scene():
@@ -197,6 +200,8 @@ class WatermarkGraphicsItem(QGraphicsPixmapItem):
             if rect.width() > 0 and rect.height() > 0:
                 self.watermark.x = self.pos().x() / rect.width()
                 self.watermark.y = self.pos().y() / rect.height()
+            if self.on_moved is not None:
+                self.on_moved(self.watermark)
         return super().itemChange(change, value)
 
 
@@ -394,6 +399,19 @@ class TimelineWidget(QWidget):
             painter.setBrush(QBrush(color))
             painter.setPen(QPen(QColor("#1a4a2a")))
             painter.drawRoundedRect(seg_rect, 4, 4)
+            # Tag the segment with how it is applied to the source audio.
+            mode_tag = {
+                "replace": "REPLACE",
+                "overlay": "OVERLAY",
+                "duck": f"DUCK {au.duck_db:.0f} dB",
+            }.get(au.mode, "")
+            painter.save()
+            painter.setClipRect(seg_rect)
+            painter.setPen(QColor("#e8ffe8"))
+            painter.drawText(seg_rect.adjusted(6, 0, -4, 0),
+                             Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                             mode_tag)
+            painter.restore()
             # No resize handles drawn - audio segments are move-only.
 
         # Playhead
@@ -600,6 +618,7 @@ class MainWindow(QMainWindow):
         self._next_audio_id = 1
         self._selected_audio: Optional[AudioAsset] = None
         self._audio_stream_checkboxes: List[QCheckBox] = []
+        self._updating_pos = False   # True while code (not the user) moves an overlay
 
         # -- media player / video scene --------------------------------
         self.scene = QGraphicsScene(self)
@@ -613,6 +632,16 @@ class MainWindow(QMainWindow):
         self.player.durationChanged.connect(self._on_duration_changed)
         self.player.positionChanged.connect(self._on_position_changed)
         self.video_item.nativeSizeChanged.connect(self._on_native_size_changed)
+
+        # Separate player for the short audio-mix preview, so it never
+        # disturbs the main video playback position.
+        self.preview_player = QMediaPlayer(self)
+        self.preview_output = QAudioOutput(self)
+        self.preview_player.setAudioOutput(self.preview_output)
+        self.preview_player.playbackStateChanged.connect(self._on_preview_state_changed)
+        self._preview_path = os.path.join(
+            tempfile.gettempdir(), f"_wm_audio_preview_{os.getpid()}.wav")
+        self._preview_worker: Optional[ExportWorker] = None
 
         self.view = VideoGraphicsView(self.scene, self)
         self.view.video_dropped.connect(self.load_video)
@@ -702,6 +731,32 @@ class MainWindow(QMainWindow):
         self.end_spin.setSuffix(" s")
         self.end_spin.valueChanged.connect(self._on_end_changed)
 
+        self.pos_x_spin = QSpinBox()
+        self.pos_x_spin.setRange(0, 100000)
+        self.pos_x_spin.setSuffix(" px")
+        self.pos_x_spin.setToolTip("Horizontal position of the watermark's centre, in video pixels.")
+        self.pos_x_spin.valueChanged.connect(lambda _v: self._on_pos_spin_changed("x"))
+
+        self.pos_y_spin = QSpinBox()
+        self.pos_y_spin.setRange(0, 100000)
+        self.pos_y_spin.setSuffix(" px")
+        self.pos_y_spin.setToolTip("Vertical position of the watermark's centre, in video pixels.")
+        self.pos_y_spin.valueChanged.connect(lambda _v: self._on_pos_spin_changed("y"))
+
+        center_x_btn = QPushButton("Center X")
+        center_x_btn.setToolTip("Center horizontally in the frame (exact at export).")
+        center_x_btn.clicked.connect(lambda: self._center_watermark(True, False))
+        center_y_btn = QPushButton("Center Y")
+        center_y_btn.setToolTip("Center vertically in the frame (exact at export).")
+        center_y_btn.clicked.connect(lambda: self._center_watermark(False, True))
+        center_both_btn = QPushButton("Center Both")
+        center_both_btn.setToolTip("Center on both axes: exactly the middle of the frame.")
+        center_both_btn.clicked.connect(lambda: self._center_watermark(True, True))
+        center_row = QHBoxLayout()
+        center_row.addWidget(center_x_btn)
+        center_row.addWidget(center_y_btn)
+        center_row.addWidget(center_both_btn)
+
         self.remove_btn = QPushButton("Remove Selected Watermark")
         self.remove_btn.clicked.connect(self._remove_selected_watermark)
 
@@ -710,12 +765,23 @@ class MainWindow(QMainWindow):
         props_box = QGroupBox("Selected Watermark")
         props_form = QFormLayout(props_box)
         props_form.addRow("Width (fraction of video):", self.scale_spin)
+        props_form.addRow("Center X:", self.pos_x_spin)
+        props_form.addRow("Center Y:", self.pos_y_spin)
+        props_form.addRow(center_row)
         props_form.addRow("Start:", self.start_spin)
         props_form.addRow("End:", self.end_spin)
         props_form.addRow(self.remove_btn)
 
         self.remove_audio_btn = QPushButton("Remove Selected Audio")
         self.remove_audio_btn.clicked.connect(self._remove_selected_audio)
+
+        self.audio_preview_btn = QPushButton("Preview Audio Mix")
+        self.audio_preview_btn.setToolTip(
+            "Renders a short clip (the selected audio's window plus a few seconds\n"
+            "of context either side) using the same filters as the export, and\n"
+            "plays it. Only the selected audio is included; the video is not."
+        )
+        self.audio_preview_btn.clicked.connect(self._preview_audio_mix)
 
         # Audio codec controls
         self.audio_codec_combo = QComboBox()
@@ -784,6 +850,7 @@ class MainWindow(QMainWindow):
         audio_props_form.addRow("Codec:", self.audio_codec_combo)
         audio_props_form.addRow("Bitrate:", self.audio_bitrate_spin)
         audio_props_form.addRow(self.audio_streams_box)
+        audio_props_form.addRow(self.audio_preview_btn)
         audio_props_form.addRow(self.remove_audio_btn)
 
         # ---------- Export options ----------
@@ -955,6 +1022,8 @@ class MainWindow(QMainWindow):
         if size.width() <= 0 or size.height() <= 0:
             return
         self.video_width, self.video_height = size.width(), size.height()
+        self.pos_x_spin.setMaximum(self.video_width)
+        self.pos_y_spin.setMaximum(self.video_height)
         self.video_item.setSize(size)  # already a QSizeF
         self.scene.setSceneRect(0, 0, size.width(), size.height())
         self.view.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
@@ -1003,6 +1072,7 @@ class MainWindow(QMainWindow):
     def _on_audio_duck_db_changed(self, value):
         if self._selected_audio:
             self._selected_audio.duck_db = value
+            self.timeline.update()
 
     def _on_audio_new_volume_changed(self, value):
         if self._selected_audio:
@@ -1061,6 +1131,7 @@ class MainWindow(QMainWindow):
         scaled = thumb.scaledToWidth(target_w, Qt.TransformationMode.SmoothTransformation)
         gitem = WatermarkGraphicsItem(wm, scaled)
         gitem.setOpacity(0.85)
+        gitem.on_moved = self._on_item_moved
         self.scene.addItem(gitem)
         wm.item = gitem
         self._position_item_from_watermark(wm)
@@ -1072,7 +1143,69 @@ class MainWindow(QMainWindow):
         target_w = max(10, int(self.video_width * wm.scale))
         scaled = thumb.scaledToWidth(target_w, Qt.TransformationMode.SmoothTransformation)
         wm.item.setPixmap(scaled)
-        wm.item.setPos(wm.x * self.video_width, wm.y * self.video_height)
+        # Axes flagged as centered are recomputed from the current size, so
+        # they stay centered when the width is changed.
+        if wm.center_x:
+            wm.x = (self.video_width - scaled.width()) / 2 / self.video_width
+        if wm.center_y:
+            wm.y = (self.video_height - scaled.height()) / 2 / self.video_height
+        self._updating_pos = True
+        try:
+            wm.item.setPos(wm.x * self.video_width, wm.y * self.video_height)
+        finally:
+            self._updating_pos = False
+        self._sync_position_spins(wm)
+
+    def _on_item_moved(self, wm: Watermark):
+        """Called when the overlay moves. A manual drag cancels centering."""
+        if self._updating_pos:
+            return
+        wm.center_x = False
+        wm.center_y = False
+        self._sync_position_spins(wm)
+
+    def _sync_position_spins(self, wm: Watermark):
+        """Show the watermark's centre point (video pixels) in the X/Y boxes."""
+        if wm is not self._selected_watermark or wm.item is None:
+            return
+        pm = wm.item.pixmap()
+        cx = round(wm.item.pos().x() + pm.width() / 2)
+        cy = round(wm.item.pos().y() + pm.height() / 2)
+        for spin, value in ((self.pos_x_spin, cx), (self.pos_y_spin, cy)):
+            spin.blockSignals(True)
+            spin.setValue(value)
+            spin.blockSignals(False)
+
+    def _on_pos_spin_changed(self, axis: str):
+        wm = self._selected_watermark
+        if wm is None or wm.item is None or self.video_width == 0:
+            return
+        pm = wm.item.pixmap()
+        x, y = wm.item.pos().x(), wm.item.pos().y()
+        if axis == "x":
+            wm.center_x = False
+            x = self.pos_x_spin.value() - pm.width() / 2
+        else:
+            wm.center_y = False
+            y = self.pos_y_spin.value() - pm.height() / 2
+        self._updating_pos = True
+        try:
+            wm.item.setPos(x, y)   # clamped to the frame by the item
+        finally:
+            self._updating_pos = False
+        self._sync_position_spins(wm)
+
+    def _center_watermark(self, horizontal: bool, vertical: bool):
+        wm = self._selected_watermark
+        if wm is None or wm.item is None or self.video_width == 0:
+            QMessageBox.information(self, "No watermark selected",
+                                     "Select a watermark first (click it on the video or the timeline).")
+            return
+        if horizontal:
+            wm.center_x = True
+        if vertical:
+            wm.center_y = True
+        self._position_item_from_watermark(wm)
 
     def _refresh_overlay_visibility(self):
         pos = self.player.position() / 1000.0
@@ -1139,6 +1272,7 @@ class MainWindow(QMainWindow):
         self.scale_spin.blockSignals(False)
         self.start_spin.blockSignals(False)
         self.end_spin.blockSignals(False)
+        self._sync_position_spins(wm)
         try:
             idx = self.watermarks.index(wm)
             self.timeline.selected_watermark_index = idx
@@ -1381,6 +1515,107 @@ class MainWindow(QMainWindow):
             return []
 
     # ------------------------------------------------------------------
+    # Audio mix preview
+    # ------------------------------------------------------------------
+    PREVIEW_PAD = 3.0    # seconds of context before/after the audio window
+    PREVIEW_MAX = 45.0   # hard cap on the rendered clip length
+
+    def _preview_audio_mix(self):
+        # Second click while playing = stop.
+        if self.preview_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self.preview_player.stop()
+            return
+        if self._preview_worker is not None and self._preview_worker.isRunning():
+            return
+        au = self._selected_audio
+        if au is None:
+            QMessageBox.information(self, "No audio selected",
+                                     "Click an audio segment on the timeline first.")
+            return
+        if not self.video_path:
+            QMessageBox.warning(self, "No video", "Load a source video first.")
+            return
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            QMessageBox.critical(self, "ffmpeg not found",
+                                  "ffmpeg was not found on PATH. Install it and try again.")
+            return
+        streams = self._probe_audio_streams(self.video_path)
+        if not streams:
+            QMessageBox.information(self, "No audio streams",
+                                     "The source video has no audio stream to mix with.")
+            return
+
+        # Preview the first targeted source stream (all streams share the
+        # same treatment, so one is enough to hear the result).
+        src_idx = au.apply_to_streams[0] if au.apply_to_streams else 0
+        src_idx = min(src_idx, len(streams) - 1)
+
+        clip_start = max(0.0, au.start - self.PREVIEW_PAD)
+        clip_len = min(max(0.5, au.end + self.PREVIEW_PAD - clip_start), self.PREVIEW_MAX)
+
+        # Release the previous preview file (Windows won't overwrite it while
+        # the player still holds it open) and keep the main video quiet.
+        self.preview_player.stop()
+        self.preview_player.setSource(QUrl())
+        self.player.pause()
+        self.play_btn.setText("Play")
+
+        # Same filter chain as the export, with times shifted so the clip
+        # starts at 0 (the input is seeked with -ss).
+        parts, out_label = self._audio_replacement_filters(
+            f"0:a:{src_idx}", 1, au, "preview", offset=clip_start)
+        cmd = [
+            ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+            "-ss", f"{clip_start:.3f}", "-i", self.video_path,
+            "-i", au.asset_path,
+            "-filter_complex", ";".join(parts),
+            "-map", f"[{out_label}]",
+            "-t", f"{clip_len:.3f}",
+            "-ac", "2", "-ar", "44100", "-c:a", "pcm_s16le",
+            self._preview_path,
+        ]
+
+        self.audio_preview_btn.setEnabled(False)
+        self.audio_preview_btn.setText("Rendering preview...")
+        self._preview_info = (
+            f"Previewing {self.timeline._fmt_time(clip_start)}"
+            f"-{self.timeline._fmt_time(clip_start + clip_len)}  "
+            f"(mode: {au.mode})"
+        )
+        worker = ExportWorker(cmd, self)
+        worker.finished_export.connect(self._on_audio_preview_rendered)
+        worker.start()
+        self._preview_worker = worker
+
+    def _on_audio_preview_rendered(self, exit_code, log_text):
+        self.audio_preview_btn.setEnabled(True)
+        self.audio_preview_btn.setText("Preview Audio Mix")
+        if exit_code != 0:
+            tail = "\n".join(log_text.splitlines()[-15:])
+            QMessageBox.critical(self, "Preview failed",
+                                  f"ffmpeg could not render the preview.\n\n{tail}")
+            return
+        self.preview_player.setSource(QUrl.fromLocalFile(self._preview_path))
+        self.preview_player.play()
+        self.statusBar().showMessage(self._preview_info, 8000)
+
+    def _on_preview_state_changed(self, state):
+        if not self.audio_preview_btn.isEnabled():
+            return  # mid-render; the button text is managed there
+        playing = state == QMediaPlayer.PlaybackState.PlayingState
+        self.audio_preview_btn.setText("Stop Preview" if playing else "Preview Audio Mix")
+
+    def closeEvent(self, event):
+        self.preview_player.stop()
+        self.preview_player.setSource(QUrl())
+        try:
+            os.remove(self._preview_path)
+        except OSError:
+            pass
+        super().closeEvent(event)
+
+    # ------------------------------------------------------------------
     def _on_rate_mode_changed(self, index):
         is_crf = (index == 0)
         self.crf_spin.setEnabled(is_crf)
@@ -1393,6 +1628,7 @@ class MainWindow(QMainWindow):
         # Save to selected audio
         if self._selected_audio:
             self._selected_audio.mode = ["replace", "overlay", "duck"][index]
+            self.timeline.update()
 
     def _match_source_bitrate(self):
         if not self.video_path:
@@ -1695,6 +1931,78 @@ class MainWindow(QMainWindow):
         except Exception:
             return 25.0
 
+    @staticmethod
+    def _audio_replacement_filters(current_label, inp_idx, au, tag, offset=0.0):
+        """Filter parts for ONE audio replacement, shared by export and the
+        audio preview so both always sound the same.
+
+        current_label: label of the audio chain so far (e.g. "0:a:0")
+        inp_idx:       ffmpeg input index of the replacement audio file
+        tag:           unique suffix for the intermediate labels
+        offset:        seconds subtracted from au.start/au.end (the preview
+                       seeks into the source, so its timeline starts later)
+
+        Returns (filter_parts, output_label).
+        """
+        ducked_label = f"ducked_{tag}"
+        delayed_label = f"delayed_{tag}"
+        out_label = f"amix_{tag}"
+        start = au.start - offset
+        end = au.end - offset
+
+        # 1. Modify the source audio during [start, end], depending on mode.
+        mode = getattr(au, "mode", "replace")
+        if mode == "replace":
+            # Silence the source completely in the window.
+            vol_expr = "volume=0"
+        elif mode == "overlay":
+            # Keep the source at full volume - no change needed.
+            vol_expr = "volume=1.0"
+        elif mode == "duck":
+            # Lower the source volume by duck_db (e.g. -12 dB).
+            # volume filter accepts a linear multiplier, so convert.
+            duck_linear = 10 ** (au.duck_db / 20.0)
+            vol_expr = f"volume={duck_linear:.4f}"
+        else:
+            vol_expr = "volume=0"
+
+        parts = [
+            f"[{current_label}]"
+            f"{vol_expr}:"
+            f"enable='between(t,{start:.3f},{end:.3f})'"
+            f"[{ducked_label}]"
+        ]
+
+        # 2. Trim the replacement to at most (end - start) long, then delay
+        #    it so it starts at `start`, then apply the user's volume
+        #    multiplier. Without the atrim, a replacement clip longer than
+        #    its window would keep playing past the window and overlap with
+        #    the original audio un-muting at that point.
+        window_dur = max(0.05, au.end - au.start)
+        delay_ms = max(0, int(start * 1000))
+        new_vol = getattr(au, "new_volume", 1.0)
+        parts.append(
+            f"[{inp_idx}:a]"
+            f"atrim=0:{window_dur:.3f},asetpts=PTS-STARTPTS,"
+            f"adelay={delay_ms}|{delay_ms},"
+            f"volume={new_vol:.4f}"
+            f"[{delayed_label}]"
+        )
+
+        # 3. Mix the (possibly modified) source with the delayed replacement.
+        #    For "overlay" mode the source is at full volume and the
+        #    replacement is added on top. For "replace" the source is silent,
+        #    so effectively only the new audio is heard. duration=first keeps
+        #    the original stream length.
+        parts.append(
+            f"[{ducked_label}][{delayed_label}]"
+            f"amix=inputs=2:duration=first:dropout_transition=0"
+            f":normalize=0"
+            f",alimiter=limit=0.95"
+            f"[{out_label}]"
+        )
+        return parts, out_label
+
     def _build_ffmpeg_command(self, output_path):
         ffmpeg = shutil.which("ffmpeg")
         if not ffmpeg:
@@ -1741,10 +2049,14 @@ class MainWindow(QMainWindow):
                 image_filter_parts.append(f"[{idx}:v]scale={wm_w}:-1[{scaled_label}]")
                 x_px = round(wm.x * width)
                 y_px = round(wm.y * height)
+                # Centered axes use ffmpeg's own expression, so the result is
+                # exact to the pixel whatever the scaled watermark size is.
+                x_expr = "(main_w-overlay_w)/2" if wm.center_x else str(x_px)
+                y_expr = "(main_h-overlay_h)/2" if wm.center_y else str(y_px)
                 out_label = f"v{k}"
                 image_filter_parts.append(
                     f"[{current_video_label}][{scaled_label}]overlay="
-                    f"x={x_px}:y={y_px}:"
+                    f"x={x_expr}:y={y_expr}:"
                     f"enable='between(t,{wm.start:.3f},{wm.end:.3f})'[{out_label}]"
                 )
                 current_video_label = out_label
@@ -1783,65 +2095,9 @@ class MainWindow(QMainWindow):
                 current_label = f"0:a:{src_idx}"
 
                 for i, (inp_idx, au) in enumerate(active):
-                    ducked_label = f"ducked_{src_idx}_{i}"
-                    delayed_label = f"delayed_{src_idx}_{i}"
-                    out_label = f"amix_{src_idx}_{i}"
-
-                    # 1. Modify the source audio during [au.start, au.end],
-                    #    depending on the mode.
-                    mode = getattr(au, "mode", "replace")
-                    if mode == "replace":
-                        # Silence the source completely in the window.
-                        vol_expr = "volume=0"
-                    elif mode == "overlay":
-                        # Keep the source at full volume - no change needed.
-                        vol_expr = "volume=1.0"
-                    elif mode == "duck":
-                        # Lower the source volume by duck_db (e.g. -12 dB).
-                        # volume filter accepts a linear multiplier, so convert.
-                        duck_linear = 10 ** (au.duck_db / 20.0)
-                        vol_expr = f"volume={duck_linear:.4f}"
-                    else:
-                        vol_expr = "volume=0"
-
-                    audio_filter_parts.append(
-                        f"[{current_label}]"
-                        f"{vol_expr}:"
-                        f"enable='between(t,{au.start:.3f},{au.end:.3f})'"
-                        f"[{ducked_label}]"
-                    )
-
-                    # 2. Trim the replacement to at most (end - start) long,
-                    #    then delay it so it starts at au.start, then apply
-                    #    the user's volume multiplier. Without the atrim, a
-                    #    replacement clip longer than its window would keep
-                    #    playing past au.end and overlap with the original
-                    #    audio un-muting at that point.
-                    window_dur = max(0.05, au.end - au.start)
-                    delay_ms = int(au.start * 1000)
-                    new_vol = getattr(au, "new_volume", 1.0)
-                    audio_filter_parts.append(
-                        f"[{inp_idx}:a]"
-                        f"atrim=0:{window_dur:.3f},asetpts=PTS-STARTPTS,"
-                        f"adelay={delay_ms}|{delay_ms},"
-                        f"volume={new_vol:.4f}"
-                        f"[{delayed_label}]"
-                    )
-
-                    # 3. Mix the (possibly modified) source with the delayed
-                    #    replacement. For "overlay" mode the source is at full
-                    #    volume and the replacement is added on top. For
-                    #    "replace" the source is silent, so effectively only
-                    #    the new audio is heard. duration=first keeps the
-                    #    original stream length.
-                    audio_filter_parts.append(
-                        f"[{ducked_label}][{delayed_label}]"
-                        f"amix=inputs=2:duration=first:dropout_transition=0"
-                        f":normalize=0"
-                        f",alimiter=limit=0.95"
-                        f"[{out_label}]"
-                    )
-                    current_label = out_label
+                    parts, current_label = self._audio_replacement_filters(
+                        current_label, inp_idx, au, f"{src_idx}_{i}")
+                    audio_filter_parts += parts
 
                 audio_out_label_by_stream[src_idx] = current_label
 
